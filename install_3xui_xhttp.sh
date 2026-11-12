@@ -2,99 +2,178 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-trap 'echo "ERROR: line $LINENO. Check output above." >&2' ERR
+trap 'echo "ERROR at line $LINENO" >&2' ERR
+
+# ==========================================
+# Debian 12 / 3x-ui / VLESS XHTTP / Nginx
+# ==========================================
 
 [[ $EUID -eq 0 ]] || {
     echo "Run as root"
     exit 1
 }
 
-. /etc/os-release
+source /etc/os-release
 
-[[ ${ID:-} == debian && ${VERSION_ID:-} == 12 ]] || {
-    echo "Requires Debian 12"
+[[ "$ID" == "debian" && "$VERSION_ID" == "12" ]] || {
+    echo "Debian 12 required"
     exit 1
 }
 
 read -rp "Domain: " DOMAIN
+read -rp "Email for Lets Encrypt: " EMAIL
 
-[[ $DOMAIN =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]] || {
+DOMAIN="${DOMAIN,,}"
+
+[[ "$DOMAIN" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$ ]] || {
     echo "Invalid domain"
     exit 1
 }
 
-read -rp "Email for Lets Encrypt: " EMAIL
-
-[[ $EMAIL == *@*.* ]] || {
+[[ "$EMAIL" == *@*.* ]] || {
     echo "Invalid email"
     exit 1
 }
 
-if [[ -e /etc/x-ui/x-ui.db || -e /usr/local/x-ui/x-ui ]]; then
-    echo "3x-ui already exists. Refusing to overwrite."
-    exit 1
-fi
-
-# Check ports BEFORE installing Nginx
-
-if ss -ltnH | awk '{print $4}' |
-    grep -Eq '(^|:)(80|443|8443|10000)$'; then
-    echo "One of ports 80,443,8443,10000 is occupied."
-    exit 1
-fi
-
-apt-get update
-
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    nginx certbot python3 sqlite3 curl openssl \
-    dnsutils ca-certificates iproute2
-
-PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org)
-
-if ! dig +short A "$DOMAIN" | grep -Fxq "$PUBLIC_IP"; then
-    echo "DNS A for $DOMAIN does not match public IP $PUBLIC_IP"
-    exit 1
-fi
+# ==========================================
+# Variables
+# ==========================================
 
 PANEL_PORT=9595
+XRAY_PORT=10000
 PANEL_USER="admin_$(openssl rand -hex 4)"
 PANEL_PASS="$(openssl rand -hex 20)"
 PANEL_PATH="$(openssl rand -hex 12)"
 
 SITE_DIR="/var/www/xhttp-decoy"
+NGINX_CONF="/etc/nginx/sites-available/xhttp-decoy"
 RESULT="/root/xhttp-install-result.txt"
+DB="/etc/x-ui/x-ui.db"
 
 umask 077
+
+# ==========================================
+# Existing installation protection
+# ==========================================
+
+if [[ -e "$DB" || -e /usr/local/x-ui/x-ui ]]; then
+    echo "3x-ui already installed."
+    echo "Refusing to overwrite existing installation."
+    exit 1
+fi
+
+# Check ports before installing packages.
+# Port 80 may already be occupied by Nginx.
+
+if ss -ltnH | awk '{print $4}' |
+    grep -Eq '(^|:)(443|8443|10000|9595)$'; then
+    echo "Required port already occupied."
+    exit 1
+fi
+
+if ss -ltnpH | grep -E '(^|:)(80)[[:space:]]' |
+    grep -qv 'nginx'; then
+    echo "Port 80 is occupied by a non-Nginx service."
+    exit 1
+fi
+
+# ==========================================
+# Dependencies
+# ==========================================
+
+apt-get update
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    nginx \
+    certbot \
+    python3 \
+    sqlite3 \
+    curl \
+    openssl \
+    dnsutils \
+    ca-certificates \
+    iproute2
+
+# ==========================================
+# DNS validation
+# ==========================================
+
+PUBLIC_IP=$(curl -4fsS --max-time 15 \
+    https://api.ipify.org)
+
+echo "Server IP: $PUBLIC_IP"
+
+if ! dig +short A "$DOMAIN" |
+    grep -Fxq "$PUBLIC_IP"; then
+    echo "DNS does not point to $PUBLIC_IP"
+    exit 1
+fi
+
+# ==========================================
+# Decoy website
+# ==========================================
 
 mkdir -p "$SITE_DIR"
 
 cat > "$SITE_DIR/index.html" <<'HTML'
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
 <title>Welcome</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: #f5f5f5;
+    color: #333;
+}
+main {
+    text-align: center;
+}
+</style>
 </head>
 <body>
+<main>
 <h1>Welcome</h1>
 <p>Website is under construction.</p>
+</main>
 </body>
 </html>
 HTML
 
+# IMPORTANT: Nginx must be able to traverse
+# the directory and read the website files.
+
+chmod 755 /var/www
 chmod 755 "$SITE_DIR"
 chmod 644 "$SITE_DIR/index.html"
 
-# Temporary HTTP site for Let's Encrypt
+mkdir -p "$SITE_DIR/.well-known/acme-challenge"
 
-cat > /etc/nginx/sites-available/xhttp-decoy <<EOF
+chmod 755 "$SITE_DIR/.well-known"
+chmod 755 "$SITE_DIR/.well-known/acme-challenge"
+
+# ==========================================
+# Temporary HTTP configuration
+# ==========================================
+
+cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-    root $SITE_DIR;
 
-    location /.well-known/acme-challenge/ {
+    root $SITE_DIR;
+    index index.html;
+
+    location ^~ /.well-known/acme-challenge/ {
+        default_type text/plain;
         try_files \$uri =404;
     }
 
@@ -104,39 +183,90 @@ server {
 }
 EOF
 
-ln -sfn /etc/nginx/sites-available/xhttp-decoy \
+ln -sfn "$NGINX_CONF" \
     /etc/nginx/sites-enabled/xhttp-decoy
 
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t
+
 systemctl enable --now nginx
 systemctl reload nginx
 
-certbot certonly --webroot \
+# ==========================================
+# Verify HTTP challenge
+# ==========================================
+
+TEST_FILE="test-$(openssl rand -hex 8)"
+
+printf 'OK\n' > \
+    "$SITE_DIR/.well-known/acme-challenge/$TEST_FILE"
+
+chmod 644 \
+    "$SITE_DIR/.well-known/acme-challenge/$TEST_FILE"
+
+HTTP_RESPONSE=$(curl -fsS \
+    --max-time 15 \
+    "http://$DOMAIN/.well-known/acme-challenge/$TEST_FILE" \
+    || true)
+
+rm -f \
+    "$SITE_DIR/.well-known/acme-challenge/$TEST_FILE"
+
+if [[ "$HTTP_RESPONSE" != "OK" ]]; then
+    echo "HTTP challenge verification failed."
+    echo "Check DNS, Nginx and port 80."
+    exit 1
+fi
+
+echo "HTTP challenge verification successful."
+
+# ==========================================
+# Let's Encrypt SSL
+# ==========================================
+
+certbot certonly \
+    --webroot \
     -w "$SITE_DIR" \
     -d "$DOMAIN" \
     --email "$EMAIL" \
     --agree-tos \
     --non-interactive \
-    --no-eff-email
+    --no-eff-email \
+    --keep-until-expiring
 
+CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+[[ -s "$CERT" && -s "$KEY" ]] || {
+    echo "SSL certificate not found."
+    exit 1
+}
+
+echo "SSL certificate ready."
+
+# ==========================================
 # Install 3x-ui
+# ==========================================
 
 echo
 echo "Installing 3x-ui..."
-echo "Choose SQLite, Skip SSL (4), localhost binding (y)."
+echo "Choose SQLite."
+echo "Skip built-in SSL configuration."
+echo "Use localhost binding if prompted."
 echo
 
 bash <(curl -fsSL \
     https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 
 [[ -x /usr/local/x-ui/x-ui ]] || {
-    echo "3x-ui binary missing"
+    echo "3x-ui binary not found."
     exit 1
 }
 
+# ==========================================
 # Configure panel
+# ==========================================
 
 /usr/local/x-ui/x-ui setting \
     -username "$PANEL_USER" \
@@ -144,9 +274,10 @@ bash <(curl -fsSL \
     -port "$PANEL_PORT" \
     -webBasePath "$PANEL_PATH"
 
-/usr/local/x-ui/x-ui setting -listenIP 127.0.0.1
+/usr/local/x-ui/x-ui setting \
+    -listenIP 127.0.0.1
 
-# Save credentials before further configuration
+# Save credentials immediately.
 
 cat > "$RESULT" <<EOF
 Domain: $DOMAIN
@@ -158,14 +289,15 @@ EOF
 
 chmod 600 "$RESULT"
 
-DB=/etc/x-ui/x-ui.db
-
-[[ -f $DB ]] || {
-    echo "Database not found: $DB"
+[[ -f "$DB" ]] || {
+    echo "3x-ui database missing."
     exit 1
 }
 
-# Create VLESS + XHTTP inbound without clients
+# ==========================================
+# Create VLESS XHTTP inbound
+# No clients or UUIDs are generated.
+# ==========================================
 
 systemctl stop x-ui
 
@@ -175,30 +307,44 @@ import json
 import sys
 
 db = sys.argv[1]
+
 con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 
 cols = {
     row["name"]: row
-    for row in con.execute("PRAGMA table_info(inbounds)")
+    for row in con.execute(
+        "PRAGMA table_info(inbounds)"
+    )
 }
 
 required = {
-    "remark", "enable", "listen", "port",
-    "protocol", "settings", "stream_settings", "tag"
+    "remark",
+    "enable",
+    "listen",
+    "port",
+    "protocol",
+    "settings",
+    "stream_settings",
+    "tag"
 }
 
 missing = required - cols.keys()
 
 if missing:
     raise SystemExit(
-        "Unexpected schema: " + repr(sorted(missing))
+        "Unexpected database schema: "
+        + repr(sorted(missing))
     )
 
-if con.execute(
-    "SELECT 1 FROM inbounds WHERE port=10000"
-).fetchone():
-    raise SystemExit("Inbound port 10000 already exists")
+existing = con.execute(
+    "SELECT id FROM inbounds WHERE port = 10000"
+).fetchone()
+
+if existing:
+    raise SystemExit(
+        "Inbound port 10000 already exists"
+    )
 
 settings = {
     "clients": [],
@@ -231,10 +377,12 @@ values = {
     "port": 10000,
     "protocol": "vless",
     "settings": json.dumps(
-        settings, separators=(",", ":")
+        settings,
+        separators=(",", ":")
     ),
     "stream_settings": json.dumps(
-        stream, separators=(",", ":")
+        stream,
+        separators=(",", ":")
     ),
     "tag": "inbound-10000",
     "sniffing": json.dumps({
@@ -262,37 +410,40 @@ values = {
 
 keys = list(values)
 
+query = (
+    "INSERT INTO inbounds ("
+    + ",".join('"' + k + '"' for k in keys)
+    + ") VALUES ("
+    + ",".join("?" for _ in keys)
+    + ")"
+)
+
 con.execute(
-    "INSERT INTO inbounds (" +
-    ",".join('"' + key + '"' for key in keys) +
-    ") VALUES (" +
-    ",".join("?" for _ in keys) + ")",
-    [values[key] for key in keys]
+    query,
+    [values[k] for k in keys]
 )
 
 con.commit()
-
-print(
-    "Created inbound ID:",
-    con.execute(
-        "SELECT id FROM inbounds WHERE port=10000"
-    ).fetchone()[0]
-)
-
 con.close()
+
+print("VLESS XHTTP inbound created.")
 PY
 
 systemctl start x-ui
 
-# HTTPS Nginx configuration
+# ==========================================
+# Final Nginx HTTPS configuration
+# ==========================================
 
-cat > /etc/nginx/sites-available/xhttp-decoy <<EOF
+cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
+
     root $SITE_DIR;
 
-    location /.well-known/acme-challenge/ {
+    location ^~ /.well-known/acme-challenge/ {
+        default_type text/plain;
         try_files \$uri =404;
     }
 
@@ -304,13 +455,17 @@ server {
 server {
     listen 443 ssl;
     server_name $DOMAIN;
-    root $SITE_DIR;
 
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    root $SITE_DIR;
+    index index.html;
+
+    ssl_certificate $CERT;
+    ssl_certificate_key $KEY;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
 
     location ^~ /vless-xhttp {
-        proxy_pass http://127.0.0.1:10000;
+        proxy_pass http://127.0.0.1:$XRAY_PORT;
         proxy_http_version 1.1;
 
         proxy_set_header Host \$host;
@@ -324,6 +479,7 @@ server {
 
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+
         client_max_body_size 0;
     }
 
@@ -336,8 +492,10 @@ server {
     listen 8443 ssl;
     server_name $DOMAIN;
 
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_certificate $CERT;
+    ssl_certificate_key $KEY;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
 
     location / {
         proxy_pass http://127.0.0.1:$PANEL_PORT;
@@ -357,22 +515,28 @@ EOF
 nginx -t
 systemctl reload nginx
 
-# Hosts are configured manually in 3x-ui
-
+# ==========================================
 # Automatic SSL renewal
+# ==========================================
 
-mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+mkdir -p \
+    /etc/letsencrypt/renewal-hooks/deploy
 
-cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+cat > \
+/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
 #!/bin/sh
-/usr/sbin/nginx -t && /bin/systemctl reload nginx
+/usr/sbin/nginx -t &&
+/bin/systemctl reload nginx
 EOF
 
-chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+chmod 755 \
+    /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
 systemctl enable --now certbot.timer
 
+# ==========================================
 # Read actual panel path
+# ==========================================
 
 PANEL_PATH=$(sqlite3 "$DB" \
     "SELECT value FROM settings WHERE key='webBasePath';")
@@ -381,37 +545,46 @@ PANEL_PATH="${PANEL_PATH#/}"
 PANEL_PATH="${PANEL_PATH%/}"
 
 [[ -n "$PANEL_PATH" ]] || {
-    echo "Panel base path is empty"
+    echo "Panel path is empty."
     exit 1
 }
 
+# ==========================================
 # Wait for panel startup
+# ==========================================
 
 echo "Waiting for 3x-ui panel..."
 
 PANEL_HTTP=000
 
 for attempt in $(seq 1 60); do
-    PANEL_HTTP=$(curl -sS --max-time 3 \
+
+    PANEL_HTTP=$(curl -sS \
+        --max-time 3 \
         -o /dev/null \
         -w '%{http_code}' \
         "http://127.0.0.1:$PANEL_PORT/$PANEL_PATH/" \
         2>/dev/null || true)
 
-    if [[ "$PANEL_HTTP" == 200 || "$PANEL_HTTP" == 302 ]]; then
+    if [[ "$PANEL_HTTP" == 200 ||
+          "$PANEL_HTTP" == 302 ]]; then
         break
     fi
 
     sleep 2
 done
 
-if [[ "$PANEL_HTTP" != 200 && "$PANEL_HTTP" != 302 ]]; then
-    echo "WARNING: panel did not respond (HTTP $PANEL_HTTP)"
+if [[ "$PANEL_HTTP" != 200 &&
+      "$PANEL_HTTP" != 302 ]]; then
+
+    echo "Panel did not respond."
     echo "Credentials saved to $RESULT"
     exit 1
 fi
 
-# Final installation result
+# ==========================================
+# Final result
+# ==========================================
 
 cat > "$RESULT" <<EOF
 ========================================
@@ -431,8 +604,13 @@ PASSWORD:
 $PANEL_PASS
 
 ----------------------------------------
-VLESS + XHTTP: configured
-Hosts: configure manually in 3x-ui
+3x-ui: installed
+VLESS XHTTP: configured
+XHTTP path: /vless-xhttp
+HTTPS port: 443
+Panel HTTPS port: 8443
+Hosts: configure manually
+Clients: add manually
 SSL: automatic renewal enabled
 ----------------------------------------
 EOF
