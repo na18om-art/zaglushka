@@ -12,7 +12,7 @@ trap 'echo "ERROR: line $LINENO. Check output above." >&2' ERR
     exit 1
 }
 
-read -rp 'Domain (example: germany.adsfree.abrdns.com): ' DOMAIN
+read -rp 'Domain: ' DOMAIN
 [[ $DOMAIN =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]] || {
     echo 'Invalid domain'
     exit 1
@@ -29,15 +29,16 @@ if [[ -e /etc/x-ui/x-ui.db || -e /usr/local/x-ui/x-ui ]]; then
     exit 1
 fi
 
+apt-get update
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    nginx certbot python3 sqlite3 curl openssl \
+    dnsutils ca-certificates iproute2
+
 if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)(80|443|8443|10000)$'; then
     echo 'One of ports 80,443,8443,10000 is occupied.'
     exit 1
 fi
-
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    nginx certbot python3 python3-certbot-nginx \
-    sqlite3 curl openssl dnsutils ca-certificates
 
 PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org)
 
@@ -50,9 +51,11 @@ PANEL_PORT=9595
 PANEL_USER="admin_$(openssl rand -hex 4)"
 PANEL_PASS="$(openssl rand -hex 20)"
 PANEL_PATH="$(openssl rand -hex 12)"
-CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
 
 SITE_DIR="/var/www/xhttp-decoy"
+RESULT="/root/xhttp-install-result.txt"
+
+umask 077
 mkdir -p "$SITE_DIR"
 
 cat > "$SITE_DIR/index.html" <<'HTML'
@@ -70,17 +73,27 @@ cat > "$SITE_DIR/index.html" <<'HTML'
 </html>
 HTML
 
+# Temporary HTTP site for Let's Encrypt
+
 cat > /etc/nginx/sites-available/xhttp-decoy <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
     root $SITE_DIR;
-    location /.well-known/acme-challenge/ { try_files \$uri =404; }
-    location / { try_files \$uri \$uri/ =404; }
+
+    location /.well-known/acme-challenge/ {
+        try_files \$uri =404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
 }
 EOF
 
-ln -sfn /etc/nginx/sites-available/xhttp-decoy /etc/nginx/sites-enabled/xhttp-decoy
+ln -sfn /etc/nginx/sites-available/xhttp-decoy \
+    /etc/nginx/sites-enabled/xhttp-decoy
+
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t
@@ -95,15 +108,22 @@ certbot certonly --webroot \
     --non-interactive \
     --no-eff-email
 
-echo '3x-ui installer will now run.'
-echo 'Choose SQLite, Skip SSL (4), and localhost binding (y).'
+# Install 3x-ui
 
-bash <(curl -fsSL https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
+echo
+echo 'Installing 3x-ui...'
+echo 'Choose SQLite, Skip SSL (4), localhost binding (y).'
+echo
+
+bash <(curl -fsSL \
+    https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 
 [[ -x /usr/local/x-ui/x-ui ]] || {
     echo '3x-ui binary missing'
     exit 1
 }
+
+# Configure panel
 
 /usr/local/x-ui/x-ui setting \
     -username "$PANEL_USER" \
@@ -112,7 +132,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/MHSanaei/3x-ui/master/instal
     -webBasePath "$PANEL_PATH"
 
 /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1
-systemctl restart x-ui
+
+# Save credentials before further configuration
+
+cat > "$RESULT" <<EOF
+Domain: $DOMAIN
+Panel URL: https://$DOMAIN:8443/$PANEL_PATH/
+Username: $PANEL_USER
+Password: $PANEL_PASS
+Status: installation in progress
+EOF
+
+chmod 600 "$RESULT"
 
 DB=/etc/x-ui/x-ui.db
 
@@ -121,18 +152,22 @@ DB=/etc/x-ui/x-ui.db
     exit 1
 }
 
+# Create VLESS + XHTTP inbound
+
 systemctl stop x-ui
 
-python3 - "$DB" "$CLIENT_UUID" <<'PY'
-import sqlite3, json, sys
+python3 - "$DB" <<'PY'
+import sqlite3
+import json
+import sys
 
-p, uuid = sys.argv[1:]
-c = sqlite3.connect(p)
-c.row_factory = sqlite3.Row
+db = sys.argv[1]
+con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
 
 cols = {
-    r['name']: r
-    for r in c.execute('PRAGMA table_info(inbounds)')
+    row['name']: row
+    for row in con.execute('PRAGMA table_info(inbounds)')
 }
 
 required = {
@@ -144,22 +179,13 @@ missing = required - cols.keys()
 if missing:
     raise SystemExit('Unexpected schema: ' + repr(sorted(missing)))
 
-if c.execute('SELECT 1 FROM inbounds WHERE port=10000').fetchone():
+if con.execute(
+    'SELECT 1 FROM inbounds WHERE port=10000'
+).fetchone():
     raise SystemExit('Inbound port 10000 already exists')
 
 settings = {
-    'clients': [{
-        'id': uuid,
-        'flow': '',
-        'email': 'client1',
-        'limitIp': 0,
-        'totalGB': 0,
-        'expiryTime': 0,
-        'enable': True,
-        'tgId': 0,
-        'subId': '',
-        'reset': 0
-    }],
+    'clients': [],
     'decryption': 'none',
     'fallbacks': []
 }
@@ -198,27 +224,42 @@ values = {
 }
 
 for name, spec in cols.items():
-    if (spec['notnull'] and spec['dflt_value'] is None
-            and name not in values and not spec['pk']):
+    if (
+        spec['notnull']
+        and spec['dflt_value'] is None
+        and name not in values
+        and not spec['pk']
+    ):
         raise SystemExit('Unknown required column: ' + name)
 
-values = {k: v for k, v in values.items() if k in cols}
+values = {
+    key: value for key, value in values.items()
+    if key in cols
+}
+
 keys = list(values)
 
-c.execute(
+con.execute(
     'INSERT INTO inbounds (' +
-    ','.join('"' + k + '"' for k in keys) +
+    ','.join('"' + key + '"' for key in keys) +
     ') VALUES (' +
     ','.join('?' for _ in keys) + ')',
-    [values[k] for k in keys]
+    [values[key] for key in keys]
 )
 
-c.commit()
-print('Created inbound ID:',
-      c.execute('SELECT id FROM inbounds WHERE port=10000').fetchone()[0])
+con.commit()
+
+print(
+    'Created inbound ID:',
+    con.execute(
+        'SELECT id FROM inbounds WHERE port=10000'
+    ).fetchone()[0]
+)
 PY
 
 systemctl start x-ui
+
+# HTTPS Nginx configuration
 
 cat > /etc/nginx/sites-available/xhttp-decoy <<EOF
 server {
@@ -291,7 +332,9 @@ EOF
 nginx -t
 systemctl reload nginx
 
-# Hosts are configured manually in the 3x-ui panel.
+# Hosts are configured manually in 3x-ui
+
+# Automatic SSL renewal
 
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 
@@ -301,9 +344,14 @@ cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
 EOF
 
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
 systemctl enable --now certbot.timer
 
-PANEL_PATH=$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='webBasePath';")
+# Read actual panel path
+
+PANEL_PATH=$(sqlite3 "$DB" \
+    "SELECT value FROM settings WHERE key='webBasePath';")
+
 PANEL_PATH="${PANEL_PATH#/}"
 PANEL_PATH="${PANEL_PATH%/}"
 
@@ -312,52 +360,55 @@ PANEL_PATH="${PANEL_PATH%/}"
     exit 1
 }
 
-PANEL_HTTP=$(curl -sS -o /dev/null -w '%{http_code}' \
-    "http://127.0.0.1:$PANEL_PORT/$PANEL_PATH/")
+# Wait for panel startup (up to 120 seconds)
 
-[[ "$PANEL_HTTP" == 200 || "$PANEL_HTTP" == 302 ]] || {
-    echo "Panel HTTP check failed: $PANEL_HTTP"
+echo 'Waiting for 3x-ui panel...'
+
+PANEL_HTTP=000
+
+for attempt in $(seq 1 60); do
+    PANEL_HTTP=$(curl -sS --max-time 3 \
+        -o /dev/null \
+        -w '%{http_code}' \
+        "http://127.0.0.1:$PANEL_PORT/$PANEL_PATH/" \
+        2>/dev/null || true)
+
+    if [[ "$PANEL_HTTP" == 200 || "$PANEL_HTTP" == 302 ]]; then
+        break
+    fi
+
+    sleep 2
+done
+
+if [[ "$PANEL_HTTP" != 200 && "$PANEL_HTTP" != 302 ]]; then
+    echo "WARNING: panel did not respond (HTTP $PANEL_HTTP)"
+    echo "Credentials saved to $RESULT"
     exit 1
-}
+fi
 
-RESULT=/root/xhttp-install-result.txt
+# Final installation result
 
 cat > "$RESULT" <<EOF
 ========================================
-       VPS INSTALLATION COMPLETE
+       INSTALLATION COMPLETE
 ========================================
 
-Domain: $DOMAIN
+DOMAIN:
+$DOMAIN
 
-Panel URL:
+PANEL URL:
 https://$DOMAIN:8443/$PANEL_PATH/
 
-Username: $PANEL_USER
-Password: $PANEL_PASS
+USERNAME:
+$PANEL_USER
+
+PASSWORD:
+$PANEL_PASS
 
 ----------------------------------------
-VLESS + XHTTP
-----------------------------------------
-
-Address: $DOMAIN
-Port: 443
-Protocol: VLESS
-Transport: XHTTP
-Mode: stream-up
-Path: /vless-xhttp
-TLS: enabled
-SNI: $DOMAIN
-Host: $DOMAIN
-Fingerprint: firefox
-
-----------------------------------------
-VLESS LINK
-----------------------------------------
-
-vless://$CLIENT_UUID@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&host=$DOMAIN&fp=firefox&alpn=http%2F1.1&type=xhttp&path=%2Fvless-xhttp&mode=stream-up#XHTTP
-
-----------------------------------------
+VLESS + XHTTP: configured
 Hosts: configure manually in 3x-ui
+SSL: automatic renewal enabled
 ----------------------------------------
 EOF
 
