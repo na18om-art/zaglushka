@@ -4,28 +4,42 @@ set -Eeuo pipefail
 
 trap 'echo "ERROR: line $LINENO. Check output above." >&2' ERR
 
-[[ $EUID -eq 0 ]] || { echo 'Run as root'; exit 1; }
+[[ $EUID -eq 0 ]] || {
+    echo "Run as root"
+    exit 1
+}
 
 . /etc/os-release
+
 [[ ${ID:-} == debian && ${VERSION_ID:-} == 12 ]] || {
-    echo 'Requires Debian 12'
+    echo "Requires Debian 12"
     exit 1
 }
 
-read -rp 'Domain: ' DOMAIN
+read -rp "Domain: " DOMAIN
+
 [[ $DOMAIN =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]] || {
-    echo 'Invalid domain'
+    echo "Invalid domain"
     exit 1
 }
 
-read -rp 'Email for Lets Encrypt: ' EMAIL
+read -rp "Email for Lets Encrypt: " EMAIL
+
 [[ $EMAIL == *@*.* ]] || {
-    echo 'Invalid email'
+    echo "Invalid email"
     exit 1
 }
 
 if [[ -e /etc/x-ui/x-ui.db || -e /usr/local/x-ui/x-ui ]]; then
-    echo '3x-ui already exists. Refusing to overwrite.'
+    echo "3x-ui already exists. Refusing to overwrite."
+    exit 1
+fi
+
+# Check ports BEFORE installing Nginx
+
+if ss -ltnH | awk '{print $4}' |
+    grep -Eq '(^|:)(80|443|8443|10000)$'; then
+    echo "One of ports 80,443,8443,10000 is occupied."
     exit 1
 fi
 
@@ -34,11 +48,6 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     nginx certbot python3 sqlite3 curl openssl \
     dnsutils ca-certificates iproute2
-
-if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)(80|443|8443|10000)$'; then
-    echo 'One of ports 80,443,8443,10000 is occupied.'
-    exit 1
-fi
 
 PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org)
 
@@ -56,6 +65,7 @@ SITE_DIR="/var/www/xhttp-decoy"
 RESULT="/root/xhttp-install-result.txt"
 
 umask 077
+
 mkdir -p "$SITE_DIR"
 
 cat > "$SITE_DIR/index.html" <<'HTML'
@@ -72,6 +82,9 @@ cat > "$SITE_DIR/index.html" <<'HTML'
 </body>
 </html>
 HTML
+
+chmod 755 "$SITE_DIR"
+chmod 644 "$SITE_DIR/index.html"
 
 # Temporary HTTP site for Let's Encrypt
 
@@ -111,15 +124,15 @@ certbot certonly --webroot \
 # Install 3x-ui
 
 echo
-echo 'Installing 3x-ui...'
-echo 'Choose SQLite, Skip SSL (4), localhost binding (y).'
+echo "Installing 3x-ui..."
+echo "Choose SQLite, Skip SSL (4), localhost binding (y)."
 echo
 
 bash <(curl -fsSL \
     https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 
 [[ -x /usr/local/x-ui/x-ui ]] || {
-    echo '3x-ui binary missing'
+    echo "3x-ui binary missing"
     exit 1
 }
 
@@ -152,7 +165,7 @@ DB=/etc/x-ui/x-ui.db
     exit 1
 }
 
-# Create VLESS + XHTTP inbound
+# Create VLESS + XHTTP inbound without clients
 
 systemctl stop x-ui
 
@@ -166,95 +179,107 @@ con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 
 cols = {
-    row['name']: row
-    for row in con.execute('PRAGMA table_info(inbounds)')
+    row["name"]: row
+    for row in con.execute("PRAGMA table_info(inbounds)")
 }
 
 required = {
-    'remark', 'enable', 'listen', 'port',
-    'protocol', 'settings', 'stream_settings', 'tag'
+    "remark", "enable", "listen", "port",
+    "protocol", "settings", "stream_settings", "tag"
 }
 
 missing = required - cols.keys()
+
 if missing:
-    raise SystemExit('Unexpected schema: ' + repr(sorted(missing)))
+    raise SystemExit(
+        "Unexpected schema: " + repr(sorted(missing))
+    )
 
 if con.execute(
-    'SELECT 1 FROM inbounds WHERE port=10000'
+    "SELECT 1 FROM inbounds WHERE port=10000"
 ).fetchone():
-    raise SystemExit('Inbound port 10000 already exists')
+    raise SystemExit("Inbound port 10000 already exists")
 
 settings = {
-    'clients': [],
-    'decryption': 'none',
-    'fallbacks': []
+    "clients": [],
+    "decryption": "none",
+    "fallbacks": []
 }
 
 stream = {
-    'network': 'xhttp',
-    'security': 'none',
-    'xhttpSettings': {
-        'path': '/vless-xhttp',
-        'mode': 'stream-up',
-        'host': '',
-        'extra': {
-            'xPaddingBytes': '100-1000'
+    "network": "xhttp",
+    "security": "none",
+    "xhttpSettings": {
+        "path": "/vless-xhttp",
+        "mode": "stream-up",
+        "host": "",
+        "extra": {
+            "xPaddingBytes": "100-1000"
         }
     }
 }
 
 values = {
-    'user_id': 1,
-    'up': 0,
-    'down': 0,
-    'total': 0,
-    'remark': 'VLESS XHTTP',
-    'enable': 1,
-    'expiry_time': 0,
-    'listen': '127.0.0.1',
-    'port': 10000,
-    'protocol': 'vless',
-    'settings': json.dumps(settings, separators=(',', ':')),
-    'stream_settings': json.dumps(stream, separators=(',', ':')),
-    'tag': 'inbound-10000',
-    'sniffing': json.dumps({
-        'enabled': False,
-        'destOverride': []
+    "user_id": 1,
+    "up": 0,
+    "down": 0,
+    "total": 0,
+    "remark": "VLESS XHTTP",
+    "enable": 1,
+    "expiry_time": 0,
+    "listen": "127.0.0.1",
+    "port": 10000,
+    "protocol": "vless",
+    "settings": json.dumps(
+        settings, separators=(",", ":")
+    ),
+    "stream_settings": json.dumps(
+        stream, separators=(",", ":")
+    ),
+    "tag": "inbound-10000",
+    "sniffing": json.dumps({
+        "enabled": False,
+        "destOverride": []
     })
 }
 
 for name, spec in cols.items():
     if (
-        spec['notnull']
-        and spec['dflt_value'] is None
+        spec["notnull"]
+        and spec["dflt_value"] is None
         and name not in values
-        and not spec['pk']
+        and not spec["pk"]
     ):
-        raise SystemExit('Unknown required column: ' + name)
+        raise SystemExit(
+            "Unknown required column: " + name
+        )
 
 values = {
-    key: value for key, value in values.items()
+    key: value
+    for key, value in values.items()
     if key in cols
 }
 
 keys = list(values)
 
 con.execute(
-    'INSERT INTO inbounds (' +
-    ','.join('"' + key + '"' for key in keys) +
-    ') VALUES (' +
-    ','.join('?' for _ in keys) + ')',
+    "INSERT INTO inbounds (" +
+    ",".join('"' + key + '"' for key in keys) +
+    ") VALUES (" +
+    ",".join("?" for _ in keys) + ")",
     [values[key] for key in keys]
 )
 
 con.commit()
 
 print(
-    'Created inbound ID:',
+    "Created inbound ID:",
     con.execute(
-        'SELECT id FROM inbounds WHERE port=10000'
+        "SELECT id FROM inbounds WHERE port=10000"
     ).fetchone()[0]
 )
+
+con.close()
 PY
 
 systemctl start x-ui
@@ -356,13 +381,13 @@ PANEL_PATH="${PANEL_PATH#/}"
 PANEL_PATH="${PANEL_PATH%/}"
 
 [[ -n "$PANEL_PATH" ]] || {
-    echo 'Panel base path is empty'
+    echo "Panel base path is empty"
     exit 1
 }
 
-# Wait for panel startup (up to 120 seconds)
+# Wait for panel startup
 
-echo 'Waiting for 3x-ui panel...'
+echo "Waiting for 3x-ui panel..."
 
 PANEL_HTTP=000
 
