@@ -40,6 +40,8 @@ DOMAIN="${DOMAIN,,}"
 # ==========================================
 
 PANEL_PORT=9595
+TCP_PORT=9443
+DECOY_PORT=8080
 XRAY_PORT=10000
 PANEL_USER="admin_$(openssl rand -hex 4)"
 PANEL_PASS="$(openssl rand -hex 20)"
@@ -66,7 +68,7 @@ fi
 # Port 80 may already be occupied by Nginx.
 
 if ss -ltnH | awk '{print $4}' |
-    grep -Eq '(^|:)(443|8443|10000|9595)$'; then
+    grep -Eq '(^|:)(443|8443|9443|10000|9595|8080)$'; then
     echo "Required port already occupied."
     exit 1
 fi
@@ -295,18 +297,19 @@ chmod 600 "$RESULT"
 }
 
 # ==========================================
-# Create VLESS XHTTP inbound
-# No clients or UUIDs are generated.
+# Create VLESS XHTTP and VLESS TCP TLS inbounds
+# Clients are added manually in 3x-ui.
 # ==========================================
 
 systemctl stop x-ui
 
-python3 - "$DB" <<'PY'
+python3 - "$DB" "$DOMAIN" <<'PY'
 import sqlite3
 import json
 import sys
 
 db = sys.argv[1]
+domain = sys.argv[2]
 
 con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
@@ -423,10 +426,41 @@ con.execute(
     [values[k] for k in keys]
 )
 
+# Second inbound: VLESS over raw TCP with TLS on port 9443.
+# Unauthenticated HTTPS requests fall back to Nginx decoy on 8080.
+tcp_settings = {
+    "clients": [],
+    "decryption": "none",
+    "fallbacks": [{"dest": 8080}]
+}
+tcp_stream = {
+    "network": "tcp",
+    "security": "tls",
+    "tcpSettings": {"acceptProxyProtocol": False},
+    "tlsSettings": {
+        "serverName": domain,
+        "certificates": [{
+            "certificateFile": f"/etc/letsencrypt/live/{domain}/fullchain.pem",
+            "keyFile": f"/etc/letsencrypt/live/{domain}/privkey.pem"
+        }],
+        "alpn": ["http/1.1"],
+        "minVersion": "1.2"
+    }
+}
+tcp_values = dict(values)
+tcp_values.update({
+    "remark": "VLESS TCP TLS",
+    "listen": "0.0.0.0",
+    "port": 9443,
+    "settings": json.dumps(tcp_settings, separators=(",", ":")),
+    "stream_settings": json.dumps(tcp_stream, separators=(",", ":")),
+    "tag": "inbound-9443"
+})
+con.execute(query, [tcp_values[k] for k in keys])
 con.commit()
 con.close()
 
-print("VLESS XHTTP inbound created.")
+print("VLESS XHTTP and TCP TLS inbounds created.")
 PY
 
 systemctl start x-ui
@@ -488,6 +522,17 @@ server {
     }
 }
 
+# HTTP decoy used as fallback for VLESS TCP TLS on port 9443.
+server {
+    listen 127.0.0.1:8080;
+    server_name $DOMAIN;
+    root $SITE_DIR;
+    index index.html;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+
 server {
     listen 8443 ssl;
     server_name $DOMAIN;
@@ -527,6 +572,7 @@ cat > \
 #!/bin/sh
 /usr/sbin/nginx -t &&
 /bin/systemctl reload nginx
+/bin/systemctl restart x-ui
 EOF
 
 chmod 755 \
@@ -576,7 +622,6 @@ done
 
 if [[ "$PANEL_HTTP" != 200 &&
       "$PANEL_HTTP" != 302 ]]; then
-
     echo "Panel did not respond."
     echo "Credentials saved to $RESULT"
     exit 1
@@ -606,12 +651,15 @@ $PANEL_PASS
 ----------------------------------------
 3x-ui: installed
 VLESS XHTTP: configured
+VLESS TCP TLS: configured (port 9443)
+TCP fallback: decoy website via Nginx on 127.0.0.1:8080
 XHTTP path: /vless-xhttp
 HTTPS port: 443
 Panel HTTPS port: 8443
 Hosts: configure manually
-Clients: add manually
+Clients: add manually to BOTH inbounds
 SSL: automatic renewal enabled
+IMPORTANT: open TCP port 9443 in provider firewall
 ----------------------------------------
 EOF
 
